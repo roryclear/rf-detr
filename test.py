@@ -11,9 +11,9 @@ from typing import List, Literal, Optional, Union
 from copy import deepcopy
 from pydantic import BaseModel, field_validator
 from rfdetr.platform.platform_downloads import PLATFORM_MODELS
-from rfdetr.util.files import download_file
 import os
 import torchvision.transforms.functional as F
+from tqdm import tqdm
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -41,6 +41,19 @@ OPEN_SOURCE_MODELS = {
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
 
+def download_file(url: str, filename: str) -> None:
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers['content-length'])
+    with open(filename, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit='iB',
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as pbar:
+        for data in response.iter_content(chunk_size=1024):
+            size = f.write(data)
+            pbar.update(size)
 
 def download_pretrain_weights(pretrain_weights: str, redownload=False):
     if pretrain_weights in HOSTED_MODELS:
