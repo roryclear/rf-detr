@@ -4,7 +4,7 @@ from PIL import Image
 import numpy as np
 from collections import defaultdict
 from rfdetr.models.backbone.dinov2 import WindowedDinov2WithRegistersConfig
-from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings
+from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel
 from transformers.utils.backbone_utils import BackboneMixin
 from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
 from transformers.modeling_outputs import BackboneOutput, BaseModelOutput
@@ -26,6 +26,7 @@ import copy
 import argparse
 from torch.nn.init import constant_, xavier_uniform_
 import json
+import collections.abc
 
 DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING = ""
 _CONFIG_FOR_DOC = ""
@@ -99,6 +100,38 @@ OPEN_SOURCE_MODELS = {
     "rf-detr-seg-xlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-xl-ft.pth",
     "rf-detr-seg-xxlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
 }
+
+class Dinov2WithRegistersPatchEmbeddings(nn.Module):
+    """
+    This class turns `pixel_values` of shape `(batch_size, num_channels, height, width)` into the initial
+    `hidden_states` (patch embeddings) of shape `(batch_size, seq_length, hidden_size)` to be consumed by a
+    Transformer.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        image_size, patch_size = config.image_size, config.patch_size
+        num_channels, hidden_size = config.num_channels, config.hidden_size
+
+        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
+        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
+        num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.num_patches = num_patches
+
+        self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        num_channels = pixel_values.shape[1]
+        if num_channels != self.num_channels:
+            raise ValueError(
+                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
+                f" Expected {self.num_channels} but got {num_channels}."
+            )
+        embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
+        return embeddings
 
 class WindowedDinov2WithRegistersEmbeddings(nn.Module):
     """
