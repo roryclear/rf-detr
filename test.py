@@ -4,10 +4,10 @@ from PIL import Image
 import numpy as np
 from collections import defaultdict
 from rfdetr.models.backbone.dinov2 import WindowedDinov2WithRegistersConfig
-from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings, WindowedDinov2WithRegistersEmbeddings, WindowedDinov2WithRegistersEncoder
+from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings, WindowedDinov2WithRegistersEmbeddings, WindowedDinov2WithRegistersLayer
 from transformers.utils.backbone_utils import BackboneMixin
 from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
-from transformers.modeling_outputs import BackboneOutput
+from transformers.modeling_outputs import BackboneOutput, BaseModelOutput
 
 import torch
 from torch import nn
@@ -100,6 +100,63 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+class WindowedDinov2WithRegistersEncoder(nn.Module):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.layer = nn.ModuleList([WindowedDinov2WithRegistersLayer(config) for _ in range(config.num_hidden_layers)])
+        self.gradient_checkpointing = config.gradient_checkpointing
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+    ) -> Union[tuple, BaseModelOutput]:
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+
+        for i, layer_module in enumerate(self.layer):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if i > int(self.config.out_features[-1][5:]):
+                # early stop if we have reached the last output feature
+                break
+
+            run_full_attention = i not in self.config.window_block_indexes
+
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    layer_module.__call__,
+                    hidden_states,
+                    layer_head_mask,
+                    output_attentions,
+                    run_full_attention,
+                )
+            else:
+                layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions, run_full_attention)
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
 
 class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedModel, BackboneMixin):
     def __init__(self, config: WindowedDinov2WithRegistersConfig):
