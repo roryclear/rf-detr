@@ -3,7 +3,29 @@ import supervision as sv
 from PIL import Image
 import numpy as np
 from collections import defaultdict
-from rfdetr.models.backbone.dinov2 import get_config, WindowedDinov2WithRegistersConfig, WindowedDinov2WithRegistersBackbone, size_to_width
+from rfdetr.models.backbone.dinov2 import get_config, WindowedDinov2WithRegistersConfig
+from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings, WindowedDinov2WithRegistersEmbeddings, WindowedDinov2WithRegistersEncoder
+from transformers.utils.backbone_utils import (
+    BackboneConfigMixin,
+    BackboneMixin,
+    get_aligned_output_features_output_indices,
+)
+
+from transformers.utils import (
+    add_code_sample_docstrings,
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    logging,
+    replace_return_docstrings,
+    torch_int,
+)
+
+from transformers.modeling_outputs import (
+    BackboneOutput,
+    BaseModelOutput,
+    BaseModelOutputWithPooling,
+    ImageClassifierOutput,
+)
 
 import torch
 from torch import nn
@@ -21,6 +43,30 @@ import copy
 import argparse
 from torch.nn.init import constant_, xavier_uniform_
 
+DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING = r"""
+    Args:
+        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`BitImageProcessor.preprocess`] for details.
+
+        head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
+            Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+"""
+
+_CONFIG_FOR_DOC = "WindowedDinov2WithRegistersConfig"
+
 COCO_CLASSES = {1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airplane", 6: "bus", 7: "train", 8: "truck", 9: "boat",
 10: "traffic light", 11: "fire hydrant", 13: "stop sign", 14: "parking meter", 15: "bench", 16: "bird", 17: "cat", 18: "dog",
 19: "horse", 20: "sheep", 21: "cow", 22: "elephant", 23: "bear", 24: "zebra", 25: "giraffe", 27: "backpack", 28: "umbrella",
@@ -34,6 +80,13 @@ COCO_CLASSES = {1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airpla
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+size_to_width = {
+    "tiny": 192,
+    "small": 384,
+    "base": 768,
+    "large": 1024,
+}
 
 PLATFORM_MODELS = {
     "rf-detr-xlarge.pth": "https://storage.googleapis.com/rfdetr/platform-licensed/rf-detr-xlarge.pth",
@@ -63,6 +116,120 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedModel, BackboneMixin):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig):
+        super().__init__(config)
+        super()._init_backbone(config)
+        self.num_features = [config.hidden_size for _ in range(config.num_hidden_layers + 1)]
+        self.embeddings = WindowedDinov2WithRegistersEmbeddings(config)
+        self.encoder = WindowedDinov2WithRegistersEncoder(config)
+
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self.num_register_tokens = config.num_register_tokens
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self) -> Dinov2WithRegistersPatchEmbeddings:
+        return self.embeddings.patch_embeddings
+
+    @add_start_docstrings_to_model_forward(DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=BackboneOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> BackboneOutput:
+        """
+        Returns:
+
+        Examples:
+        Returns:
+
+        Examples:
+
+
+        ```python
+        >>> from transformers import AutoImageProcessor, AutoBackbone
+        >>> import torch
+        >>> from PIL import Image
+        >>> import requests
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> processor = AutoImageProcessor.from_pretrained("facebook/dinov2-with-registers-base")
+        >>> model = AutoBackbone.from_pretrained(
+        ...     "facebook/dinov2-with-registers-base", out_features=["stage2", "stage5", "stage8", "stage11"]
+        ... )
+
+        >>> inputs = processor(image, return_tensors="pt")
+
+        >>> outputs = model(**inputs)
+        >>> feature_maps = outputs.feature_maps
+        >>> list(feature_maps[-1].shape)
+        [1, 768, 16, 16]
+        ```"""
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+
+        embedding_output = self.embeddings(pixel_values)
+
+        outputs = self.encoder(
+            embedding_output, output_hidden_states=True, output_attentions=output_attentions, return_dict=return_dict
+        )
+
+        hidden_states = outputs.hidden_states if return_dict else outputs[1]
+
+        feature_maps = ()
+        for stage, hidden_state in zip(self.stage_names, hidden_states):
+            if stage in self.out_features:
+                if self.config.apply_layernorm:
+                    hidden_state = self.layernorm(hidden_state)
+                if self.config.reshape_hidden_states:
+                    hidden_state = hidden_state[:, self.num_register_tokens + 1 :]
+                    # this was actually a bug in the original implementation that we copied here,
+                    # cause normally the order is height, width
+                    batch_size, _, height, width = pixel_values.shape
+                    patch_size = self.config.patch_size
+
+                    num_h_patches = height // patch_size
+                    num_w_patches = width // patch_size
+
+                    if self.config.num_windows > 1:
+                        # undo windowing
+                        num_windows_squared = self.config.num_windows ** 2
+                        B, HW, C = hidden_state.shape
+                        num_h_patches_per_window = num_h_patches // self.config.num_windows
+                        num_w_patches_per_window = num_w_patches // self.config.num_windows
+                        hidden_state = hidden_state.reshape(B // num_windows_squared, num_windows_squared * HW, C)
+                        hidden_state = hidden_state.reshape((B // num_windows_squared) * self.config.num_windows, self.config.num_windows, num_h_patches_per_window, num_w_patches_per_window, C)
+                        hidden_state = hidden_state.permute(0, 2, 1, 3, 4)
+
+                    hidden_state = hidden_state.reshape(batch_size, num_h_patches, num_w_patches, -1)
+                    hidden_state = hidden_state.permute(0, 3, 1, 2).contiguous()
+
+                feature_maps += (hidden_state,)
+
+        if not return_dict:
+            if output_hidden_states:
+                output = (feature_maps,) + outputs[1:]
+            else:
+                output = (feature_maps,) + outputs[2:]
+            return output
+
+        return BackboneOutput(
+            feature_maps=feature_maps,
+            hidden_states=outputs.hidden_states if output_hidden_states else None,
+            attentions=outputs.attentions if output_attentions else None,
+        )
 
 class DinoV2(nn.Module):
     def __init__(self,
