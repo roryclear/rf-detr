@@ -3,13 +3,16 @@ import supervision as sv
 from PIL import Image
 import numpy as np
 from collections import defaultdict
-from rfdetr.main import populate_args, build_model
+from rfdetr.main import populate_args
+from rfdetr.models.backbone import build_backbone
+from rfdetr.models.transformer import build_transformer
+from rfdetr.models.lwdetr import LWDETR
+
 import torch
 from torch import nn
 from typing import List, Literal, Optional, Union
 from copy import deepcopy
 from pydantic import BaseModel, field_validator
-from rfdetr.platform.platform_downloads import PLATFORM_MODELS
 import os
 import torchvision.transforms.functional as F
 from tqdm import tqdm
@@ -27,6 +30,12 @@ COCO_CLASSES = {1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airpla
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+PLATFORM_MODELS = {
+    "rf-detr-xlarge.pth": "https://storage.googleapis.com/rfdetr/platform-licensed/rf-detr-xlarge.pth",
+    "rf-detr-xxlarge.pth": "https://storage.googleapis.com/rfdetr/platform-licensed/rf-detr-xxlarge.pth",
+}
+
 
 OPEN_SOURCE_MODELS = {
     "rf-detr-base.pth": "https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth",
@@ -51,6 +60,67 @@ OPEN_SOURCE_MODELS = {
 
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def build_model(args):
+    # the `num_classes` naming here is somewhat misleading.
+    # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
+    # is the maximum id for a class in your dataset. For example,
+    # COCO has a max_obj_id of 90, so we pass `num_classes` to be 91.
+    # As another example, for a dataset that has a single class with id 1,
+    # you should pass `num_classes` to be 2 (max_obj_id + 1).
+    # For more details on this, check the following discussion
+    # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
+    num_classes = args.num_classes + 1
+    torch.device(args.device)
+
+
+    backbone = build_backbone(
+        encoder=args.encoder,
+        vit_encoder_num_layers=args.vit_encoder_num_layers,
+        pretrained_encoder=args.pretrained_encoder,
+        window_block_indexes=args.window_block_indexes,
+        drop_path=args.drop_path,
+        out_channels=args.hidden_dim,
+        out_feature_indexes=args.out_feature_indexes,
+        projector_scale=args.projector_scale,
+        use_cls_token=args.use_cls_token,
+        hidden_dim=args.hidden_dim,
+        position_embedding=args.position_embedding,
+        freeze_encoder=args.freeze_encoder,
+        layer_norm=args.layer_norm,
+        target_shape=args.shape if hasattr(args, 'shape') else (args.resolution, args.resolution) if hasattr(args, 'resolution') else (640, 640),
+        rms_norm=args.rms_norm,
+        backbone_lora=args.backbone_lora,
+        force_no_pretrain=args.force_no_pretrain,
+        gradient_checkpointing=args.gradient_checkpointing,
+        load_dinov2_weights=args.pretrain_weights is None,
+        patch_size=args.patch_size,
+        num_windows=args.num_windows,
+        positional_encoding_size=args.positional_encoding_size,
+    )
+    if args.encoder_only:
+        return backbone[0].encoder, None, None
+    if args.backbone_only:
+        return backbone, None, None
+
+    args.num_feature_levels = len(args.projector_scale)
+    transformer = build_transformer(args)
+
+    segmentation_head = SegmentationHead(args.hidden_dim, args.dec_layers, downsample_ratio=args.mask_downsample_ratio) if args.segmentation_head else None
+
+    model = LWDETR(
+        backbone,
+        transformer,
+        segmentation_head,
+        num_classes=num_classes,
+        num_queries=args.num_queries,
+        aux_loss=args.aux_loss,
+        group_detr=args.group_detr,
+        two_stage=args.two_stage,
+        lite_refpoint_refine=args.lite_refpoint_refine,
+        bbox_reparam=args.bbox_reparam,
+    )
+    return model
 
 def download_file(url: str, filename: str) -> None:
     response = requests.get(url, stream=True)
