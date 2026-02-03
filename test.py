@@ -5,13 +5,13 @@ import numpy as np
 from collections import defaultdict
 from rfdetr.models.transformer import build_transformer
 from rfdetr.models.position_encoding import build_position_encoding
-from rfdetr.models.backbone import Backbone, Joiner
+from rfdetr.models.backbone import Backbone
 
 import torch
 from torch import nn
 from torch import Tensor
 import torchvision
-from typing import List, Literal, Optional, Union, Tuple
+from typing import List, Literal, Optional, Union, Tuple, Callable
 from copy import deepcopy
 from pydantic import BaseModel, field_validator
 import os
@@ -64,6 +64,7 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
 
 def build_backbone(
     encoder,
@@ -369,6 +370,32 @@ class NestedTensor(object):
 
     def __repr__(self) -> str:
         return str(self.tensors)
+
+class Joiner(nn.Sequential):
+    def __init__(self, backbone, position_embedding):
+        super().__init__(backbone, position_embedding)
+        self._export = False
+
+    def forward(self, tensor_list: NestedTensor):
+        """ """
+        x = self[0](tensor_list)
+        pos = []
+        for x_ in x:
+            pos.append(self[1](x_, align_dim_orders=False).to(x_.tensors.dtype))
+        return x, pos
+
+    def export(self):
+        self._export = True
+        self._forward_origin = self.forward
+        self.forward = self.forward_export
+        for name, m in self.named_modules():
+            if (
+                hasattr(m, "export")
+                and isinstance(m.export, Callable)
+                and hasattr(m, "_export")
+                and not m._export
+            ):
+                m.export()
 
 def _max_by_axis(the_list: List[List[int]]) -> List[int]:
     maxes = the_list[0]
