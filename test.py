@@ -3,8 +3,9 @@ import supervision as sv
 from PIL import Image
 import numpy as np
 from collections import defaultdict
-from rfdetr.models.backbone import build_backbone
 from rfdetr.models.transformer import build_transformer
+from rfdetr.models.position_encoding import build_position_encoding
+from rfdetr.models.backbone import Backbone, Joiner
 
 import torch
 from torch import nn
@@ -63,6 +64,64 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def build_backbone(
+    encoder,
+    vit_encoder_num_layers,
+    pretrained_encoder,
+    window_block_indexes,
+    drop_path,
+    out_channels,
+    out_feature_indexes,
+    projector_scale,
+    use_cls_token,
+    hidden_dim,
+    position_embedding,
+    freeze_encoder,
+    layer_norm,
+    target_shape,
+    rms_norm,
+    backbone_lora,
+    force_no_pretrain,
+    gradient_checkpointing,
+    load_dinov2_weights,
+    patch_size,
+    num_windows,
+    positional_encoding_size,
+):
+    """
+    Useful args:
+        - encoder: encoder name
+        - lr_encoder:
+        - dilation
+        - use_checkpoint: for swin only for now
+
+    """
+    position_embedding = build_position_encoding(hidden_dim, position_embedding)
+
+    backbone = Backbone(
+        encoder,
+        pretrained_encoder,
+        window_block_indexes=window_block_indexes,
+        drop_path=drop_path,
+        out_channels=out_channels,
+        out_feature_indexes=out_feature_indexes,
+        projector_scale=projector_scale,
+        use_cls_token=use_cls_token,
+        layer_norm=layer_norm,
+        freeze_encoder=freeze_encoder,
+        target_shape=target_shape,
+        rms_norm=rms_norm,
+        backbone_lora=backbone_lora,
+        gradient_checkpointing=gradient_checkpointing,
+        load_dinov2_weights=load_dinov2_weights,
+        patch_size=patch_size,
+        num_windows=num_windows,
+        positional_encoding_size=positional_encoding_size,
+    )
+
+    model = Joiner(backbone, position_embedding)
+    return model
 
 def populate_args(
     # Basic training parameters
