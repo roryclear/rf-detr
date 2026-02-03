@@ -4,10 +4,10 @@ from PIL import Image
 import numpy as np
 from collections import defaultdict
 from rfdetr.models.transformer import build_transformer
-from rfdetr.models.position_encoding import build_position_encoding
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
 from rfdetr.models.backbone.projector import MultiScaleProjector
+from rfdetr.models.position_encoding import PositionEmbeddingSine
 
 import torch
 from torch import nn
@@ -66,6 +66,19 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def build_position_encoding(hidden_dim, position_embedding):
+    N_steps = hidden_dim // 2
+    if position_embedding in ('v2', 'sine'):
+        # TODO find a better way of exposing other arguments
+        position_embedding = PositionEmbeddingSine(N_steps, normalize=True)
+    elif position_embedding in ('v3', 'learned'):
+        position_embedding = PositionEmbeddingLearned(N_steps)
+    else:
+        raise ValueError(f"not supported {position_embedding}")
+
+    return position_embedding
+
 
 class NestedTensor(object):
     def __init__(self, tensors: Tensor, mask: Optional[Tensor]) -> None:
