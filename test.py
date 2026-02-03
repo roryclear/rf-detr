@@ -6,7 +6,7 @@ from collections import defaultdict
 from rfdetr.models.transformer import build_transformer
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
-from rfdetr.models.backbone.projector import MultiScaleProjector
+from rfdetr.models.backbone.projector import C2f, LayerNorm
 
 import torch
 from torch import nn
@@ -65,6 +65,158 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def get_norm(norm, out_channels):
+    """
+    Args:
+        norm (str or callable): either one of BN, SyncBN, FrozenBN, GN;
+            or a callable that takes a channel number and returns
+            the normalization layer as a nn.Module.
+    Returns:
+        nn.Module or None: the normalization layer
+    """
+    if norm is None:
+        return None
+    if isinstance(norm, str):
+        if len(norm) == 0:
+            return None
+        norm = {
+            "LN": lambda channels: LayerNorm(channels),
+        }[norm]
+    return norm(out_channels)
+
+
+class MultiScaleProjector(nn.Module):
+    """
+    This module implements MultiScaleProjector in :paper:`lwdetr`.
+    It creates pyramid features built on top of the input feature map.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        scale_factors,
+        num_blocks=3,
+        layer_norm=False,
+        rms_norm=False,
+        survival_prob=1.0,
+        force_drop_last_n_features=0,
+    ):
+        """
+        Args:
+            net (Backbone): module representing the subnetwork backbone.
+                Must be a subclass of :class:`Backbone`.
+            out_channels (int): number of channels in the output feature maps.
+            scale_factors (list[float]): list of scaling factors to upsample or downsample
+                the input features for creating pyramid features.
+        """
+        super(MultiScaleProjector, self).__init__()
+
+        self.scale_factors = scale_factors
+        self.survival_prob = survival_prob
+        self.force_drop_last_n_features = force_drop_last_n_features
+
+        stages_sampling = []
+        stages = []
+        # use_bias = norm == ""
+        self.use_extra_pool = False
+        for scale in scale_factors:
+            stages_sampling.append([])
+            for in_dim in in_channels:
+                layers = []
+
+                # if in_dim > 512:
+                #     layers.append(ConvX(in_dim, in_dim // 2, kernel=1))
+                #     in_dim = in_dim // 2
+
+                if scale == 4.0:
+                    layers.extend([
+                        nn.ConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2),
+                        get_norm('LN', in_dim // 2),
+                        nn.GELU(),
+                        nn.ConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
+                    ])
+                    # in_dim // 4
+                elif scale == 2.0:
+                    # a hack to reduce the FLOPs and Params when the dimention of output feature is too large
+                    # if in_dim > 512:
+                    #     layers = [
+                    #         ConvX(in_dim, in_dim // 2, kernel=1),
+                    #         nn.ConvTranspose2d(in_dim // 2, in_dim // 4, kernel_size=2, stride=2),
+                    #     ]
+                    #     out_dim = in_dim // 4
+                    # else:
+                    layers.extend([
+                        nn.ConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2),
+                    ])
+                    # in_dim // 2
+                elif scale == 1.0:
+                    pass
+                elif scale == 0.5:
+                    layers.extend([
+                        ConvX(in_dim, in_dim, 3, 2, layer_norm=layer_norm),
+                    ])
+                elif scale == 0.25:
+                    self.use_extra_pool = True
+                    continue
+                else:
+                    raise NotImplementedError("Unsupported scale_factor:{}".format(scale))
+                layers = nn.Sequential(*layers)
+                stages_sampling[-1].append(layers)
+            stages_sampling[-1] = nn.ModuleList(stages_sampling[-1])
+
+            in_dim = int(sum(in_channel // max(1, scale) for in_channel in in_channels))
+            layers = [
+                C2f(in_dim, out_channels, num_blocks, layer_norm=layer_norm),
+                get_norm('LN', out_channels),
+            ]
+            layers = nn.Sequential(*layers)
+            stages.append(layers)
+
+        self.stages_sampling = nn.ModuleList(stages_sampling)
+        self.stages = nn.ModuleList(stages)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (N,C,H,W). H, W must be a multiple of ``self.size_divisibility``.
+        Returns:
+            dict[str->Tensor]:
+                mapping from feature map name to pyramid feature map tensor
+                in high to low resolution order. Returned feature names follow the FPN
+                convention: "p<stage>", where stage has stride = 2 ** stage e.g.,
+                ["p2", "p3", ..., "p6"].
+        """
+        num_features = len(x)
+        if self.survival_prob < 1.0 and self.training:
+            final_drop_prob = 1 - self.survival_prob
+            drop_p = np.random.uniform()
+            for i in range(1, num_features):
+                critical_drop_prob = i * (final_drop_prob / (num_features - 1))
+                if drop_p < critical_drop_prob:
+                    x[i][:] = 0
+        elif self.force_drop_last_n_features > 0:
+            for i in range(self.force_drop_last_n_features):
+                # don't do it inplace to ensure the compiler can optimize out the backbone layers
+                x[-(i+1)] = torch.zeros_like(x[-(i+1)])
+
+        results = []
+        # x list of len(out_features_indexes)
+        for i, stage in enumerate(self.stages):
+            feat_fuse = []
+            for j, stage_sampling in enumerate(self.stages_sampling[i]):
+                feat_fuse.append(stage_sampling(x[j]))
+            if len(feat_fuse) > 1:
+                feat_fuse = torch.cat(feat_fuse, dim=1)
+            else:
+                feat_fuse = feat_fuse[0]
+            results.append(stage(feat_fuse))
+        if self.use_extra_pool:
+            results.append(
+                F.max_pool2d(results[-1], kernel_size=1, stride=2, padding=0)
+            )
+        return results
 
 class NestedTensor(object):
     def __init__(self, tensors: Tensor, mask: Optional[Tensor]) -> None:
