@@ -5,13 +5,12 @@ import numpy as np
 from collections import defaultdict
 from rfdetr.models.backbone import build_backbone
 from rfdetr.models.transformer import build_transformer
-from rfdetr.util.misc import NestedTensor
 
 import torch
 from torch import nn
 from torch import Tensor
 import torchvision
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union, Tuple
 from copy import deepcopy
 from pydantic import BaseModel, field_validator
 import os
@@ -290,6 +289,27 @@ def populate_args(
         **extra_kwargs
     )
     return args
+
+class NestedTensor(object):
+    def __init__(self, tensors: Tensor, mask: Optional[Tensor]) -> None:
+        self.tensors = tensors
+        self.mask = mask
+
+    def to(self, device: torch.device) -> 'NestedTensor':
+        cast_tensor = self.tensors.to(device)
+        mask = self.mask
+        if mask is not None:
+            assert mask is not None
+            cast_mask = mask.to(device)
+        else:
+            cast_mask = None
+        return NestedTensor(cast_tensor, cast_mask)
+
+    def decompose(self) -> Tuple[Tensor, Optional[Tensor]]:
+        return self.tensors, self.mask
+
+    def __repr__(self) -> str:
+        return str(self.tensors)
 
 def _max_by_axis(the_list: List[List[int]]) -> List[int]:
     maxes = the_list[0]
