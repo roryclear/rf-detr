@@ -4,7 +4,7 @@ from PIL import Image
 import numpy as np
 from collections import defaultdict
 from rfdetr.models.backbone.dinov2 import DinoV2
-from rfdetr.models.transformer import TransformerDecoderLayer, TransformerDecoder, gen_encoder_output_proposals
+from rfdetr.models.transformer import TransformerDecoderLayer
 
 import torch
 from torch import nn
@@ -63,6 +63,230 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def gen_sineembed_for_position(pos_tensor, dim=128):
+    # n_query, bs, _ = pos_tensor.size()
+    # sineembed_tensor = torch.zeros(n_query, bs, 256)
+    scale = 2 * math.pi
+    dim_t = torch.arange(dim, dtype=pos_tensor.dtype, device=pos_tensor.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / dim)
+    x_embed = pos_tensor[:, :, 0] * scale
+    y_embed = pos_tensor[:, :, 1] * scale
+    pos_x = x_embed[:, :, None] / dim_t
+    pos_y = y_embed[:, :, None] / dim_t
+    pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+    pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
+    if pos_tensor.size(-1) == 2:
+        pos = torch.cat((pos_y, pos_x), dim=2)
+    elif pos_tensor.size(-1) == 4:
+        w_embed = pos_tensor[:, :, 2] * scale
+        pos_w = w_embed[:, :, None] / dim_t
+        pos_w = torch.stack((pos_w[:, :, 0::2].sin(), pos_w[:, :, 1::2].cos()), dim=3).flatten(2)
+
+        h_embed = pos_tensor[:, :, 3] * scale
+        pos_h = h_embed[:, :, None] / dim_t
+        pos_h = torch.stack((pos_h[:, :, 0::2].sin(), pos_h[:, :, 1::2].cos()), dim=3).flatten(2)
+
+        pos = torch.cat((pos_y, pos_x, pos_w, pos_h), dim=2)
+    else:
+        raise ValueError("Unknown pos_tensor shape(-1):{}".format(pos_tensor.size(-1)))
+    return pos
+
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+class TransformerDecoder(nn.Module):
+
+    def __init__(self,
+                 decoder_layer,
+                 num_layers,
+                 norm=None,
+                 return_intermediate=False,
+                 d_model=256,
+                 lite_refpoint_refine=False,
+                 bbox_reparam=False):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+        self.lite_refpoint_refine = lite_refpoint_refine
+        self.bbox_reparam = bbox_reparam
+
+        self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
+
+        self._export = False
+
+    def export(self):
+        self._export = True
+
+    def refpoints_refine(self, refpoints_unsigmoid, new_refpoints_delta):
+        if self.bbox_reparam:
+            new_refpoints_cxcy = new_refpoints_delta[..., :2] * refpoints_unsigmoid[..., 2:] + refpoints_unsigmoid[..., :2]
+            new_refpoints_wh = new_refpoints_delta[..., 2:].exp() * refpoints_unsigmoid[..., 2:]
+            new_refpoints_unsigmoid = torch.concat(
+                [new_refpoints_cxcy, new_refpoints_wh], dim=-1
+            )
+        else:
+            new_refpoints_unsigmoid = refpoints_unsigmoid + new_refpoints_delta
+        return new_refpoints_unsigmoid
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                refpoints_unsigmoid: Optional[Tensor] = None,
+                # for memory
+                level_start_index: Optional[Tensor] = None, # num_levels
+                spatial_shapes: Optional[Tensor] = None, # bs, num_levels, 2
+                valid_ratios: Optional[Tensor] = None):
+        output = tgt
+
+        intermediate = []
+        hs_refpoints_unsigmoid = [refpoints_unsigmoid]
+
+        def get_reference(refpoints):
+            # [num_queries, batch_size, 4]
+            obj_center = refpoints[..., :4]
+
+            if self._export:
+                query_sine_embed = gen_sineembed_for_position(obj_center, self.d_model / 2) # bs, nq, 256*2
+                refpoints_input = obj_center[:, :, None] # bs, nq, 1, 4
+            else:
+                refpoints_input = obj_center[:, :, None] \
+                                        * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # bs, nq, nlevel, 4
+                query_sine_embed = gen_sineembed_for_position(
+                    refpoints_input[:, :, 0, :], self.d_model / 2) # bs, nq, 256*2
+            query_pos = self.ref_point_head(query_sine_embed)
+            return obj_center, refpoints_input, query_pos, query_sine_embed
+
+        # always use init refpoints
+        if self.lite_refpoint_refine:
+            if self.bbox_reparam:
+                obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
+            else:
+                obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
+
+        for layer_id, layer in enumerate(self.layers):
+            # iter refine each layer
+            if not self.lite_refpoint_refine:
+                if self.bbox_reparam:
+                    obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
+                else:
+                    obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
+
+            # For the first decoder layer, we do not apply transformation over p_s
+            pos_transformation = 1
+
+            query_pos = query_pos * pos_transformation
+
+            output = layer(output, memory, tgt_mask=tgt_mask,
+                           memory_mask=memory_mask,
+                           tgt_key_padding_mask=tgt_key_padding_mask,
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
+                           is_first=(layer_id == 0),
+                           reference_points=refpoints_input,
+                           spatial_shapes=spatial_shapes,
+                           level_start_index=level_start_index)
+
+            if not self.lite_refpoint_refine:
+                # box iterative update
+                new_refpoints_delta = self.bbox_embed(output)
+                new_refpoints_unsigmoid = self.refpoints_refine(refpoints_unsigmoid, new_refpoints_delta)
+                if layer_id != self.num_layers - 1:
+                    hs_refpoints_unsigmoid.append(new_refpoints_unsigmoid)
+                refpoints_unsigmoid = new_refpoints_unsigmoid.detach()
+
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
+
+        if self.norm is not None:
+            output = self.norm(output)
+            if self.return_intermediate:
+                intermediate.pop()
+                intermediate.append(output)
+
+        if self.return_intermediate:
+            if self._export:
+                # to shape: B, N, C
+                hs = intermediate[-1]
+                if self.bbox_embed is not None:
+                    ref = hs_refpoints_unsigmoid[-1]
+                else:
+                    ref = refpoints_unsigmoid
+                return hs, ref
+            # box iterative update
+            if self.bbox_embed is not None:
+                return [
+                    torch.stack(intermediate),
+                    torch.stack(hs_refpoints_unsigmoid),
+                ]
+            else:
+                return [
+                    torch.stack(intermediate),
+                    refpoints_unsigmoid.unsqueeze(0)
+                ]
+
+        return output.unsqueeze(0)
+
+def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, unsigmoid=True):
+    r"""
+    Input:
+        - memory: bs, \sum{hw}, d_model
+        - memory_padding_mask: bs, \sum{hw}
+        - spatial_shapes: nlevel, 2
+    Output:
+        - output_memory: bs, \sum{hw}, d_model
+        - output_proposals: bs, \sum{hw}, 4
+    """
+    N_, S_, C_ = memory.shape
+    proposals = []
+    _cur = 0
+    for lvl, (H_, W_) in enumerate(spatial_shapes):
+        if memory_padding_mask is not None:
+            mask_flatten_ = memory_padding_mask[:, _cur:(_cur + H_ * W_)].view(N_, H_, W_, 1)
+            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
+            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
+        else:
+            valid_H = torch.tensor([H_ for _ in range(N_)], device=memory.device)
+            valid_W = torch.tensor([W_ for _ in range(N_)], device=memory.device)
+
+        grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
+                                        torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
+        grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1) # H_, W_, 2
+
+        scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N_, 1, 1, 2)
+        grid = (grid.unsqueeze(0).expand(N_, -1, -1, -1) + 0.5) / scale
+
+        wh = torch.ones_like(grid) * 0.05 * (2.0 ** lvl)
+
+        proposal = torch.cat((grid, wh), -1).view(N_, -1, 4)
+        proposals.append(proposal)
+        _cur += (H_ * W_)
+
+    output_proposals = torch.cat(proposals, 1)
+    output_proposals_valid = ((output_proposals > 0.01) & (output_proposals < 0.99)).all(-1, keepdim=True)
+
+    if unsigmoid:
+        output_proposals = torch.log(output_proposals / (1 - output_proposals)) # unsigmoid
+        if memory_padding_mask is not None:
+            output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float('inf'))
+        output_proposals = output_proposals.masked_fill(~output_proposals_valid, float('inf'))
+    else:
+        if memory_padding_mask is not None:
+            output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
+        output_proposals = output_proposals.masked_fill(~output_proposals_valid, float(0))
+
+    output_memory = memory
+    if memory_padding_mask is not None:
+        output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
+    output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
+
+    return output_memory.to(memory.dtype), output_proposals.to(memory.dtype)
 
 class MSDeformAttn(nn.Module):
     """Multi-Scale Deformable Attention Module
