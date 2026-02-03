@@ -4,16 +4,51 @@ from PIL import Image
 from rfdetr.util.coco_classes import COCO_CLASSES
 import numpy as np
 from collections import defaultdict
-from rfdetr.main import download_pretrain_weights, populate_args, build_model
+from rfdetr.main import populate_args, build_model
 import torch
 from torch import nn
 from typing import List, Literal, Optional, Union
 from copy import deepcopy
 from pydantic import BaseModel, field_validator
+from rfdetr.platform.platform_downloads import PLATFORM_MODELS
+from rfdetr.util.files import download_file
 import os
 import torchvision.transforms.functional as F
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+OPEN_SOURCE_MODELS = {
+    "rf-detr-base.pth": "https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth",
+    "rf-detr-base-o365.pth": "https://storage.googleapis.com/rfdetr/top-secret-1234/lwdetr_dinov2_small_o365_checkpoint.pth",
+    # below is a less converged model that may be better for finetuning but worse for inference
+    "rf-detr-base-2.pth": "https://storage.googleapis.com/rfdetr/rf-detr-base-2.pth",
+    "rf-detr-large.pth": "https://storage.googleapis.com/rfdetr/rf-detr-large.pth",
+    "rf-detr-nano.pth": "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+    "rf-detr-small.pth": "https://storage.googleapis.com/rfdetr/small_coco/checkpoint_best_regular.pth",
+    "rf-detr-medium.pth": "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
+    "rf-detr-seg-preview.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-preview.pt",
+    "rf-detr-large-2026.pth": "https://storage.googleapis.com/rfdetr/rf-detr-large-2026.pth",
+    "rf-detr-xlarge.pth": "https://storage.googleapis.com/rfdetr/rf-detr-xl-ft.pth",
+    "rf-detr-xxlarge.pth": "https://storage.googleapis.com/rfdetr/rf-detr-2xl-ft.pth",
+    "rf-detr-seg-nano.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-n-ft.pth",
+    "rf-detr-seg-small.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-s-ft.pth",
+    "rf-detr-seg-medium.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-m-ft.pth",
+    "rf-detr-seg-large.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-l-ft.pth",
+    "rf-detr-seg-xlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-xl-ft.pth",
+    "rf-detr-seg-xxlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
+}
+
+
+HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+
+def download_pretrain_weights(pretrain_weights: str, redownload=False):
+    if pretrain_weights in HOSTED_MODELS:
+        if redownload or not os.path.exists(pretrain_weights):
+            download_file(
+                HOSTED_MODELS[pretrain_weights],
+                pretrain_weights,
+            )
 
 def box_cxcywh_to_xyxy(x: torch.Tensor) -> torch.Tensor:
     x_c, y_c, w, h = x.unbind(-1)
