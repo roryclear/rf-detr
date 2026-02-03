@@ -4,7 +4,7 @@ from PIL import Image
 from rfdetr.util.coco_classes import COCO_CLASSES
 import numpy as np
 from collections import defaultdict
-from rfdetr.main import Model, download_pretrain_weights
+from rfdetr.main import download_pretrain_weights, populate_args, build_model, PostProcess
 import torch
 from typing import List, Literal, Optional, Union
 from copy import deepcopy
@@ -13,6 +13,29 @@ import os
 import torchvision.transforms.functional as F
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+class Model:
+    def __init__(self, **kwargs):
+        args = populate_args(**kwargs)
+        self.args = args
+        self.resolution = args.resolution
+        self.model = build_model(args)
+        self.device = torch.device(args.device)
+        if args.pretrain_weights is not None:
+            print("Loading pretrain weights")
+            try:
+                checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
+            except Exception as e:
+                print(f"Failed to load pretrain weights: {e}")
+                # re-download weights if they are corrupted
+                print("Failed to load pretrain weights, re-downloading")
+                download_pretrain_weights(args.pretrain_weights, redownload=True)
+                checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
+            self.model.load_state_dict(checkpoint['model'], strict=False)
+
+        self.model = self.model.to(self.device)
+        self.postprocess = PostProcess(num_select=args.num_select)
+        self.stop_early = False
 
 class ModelConfig(BaseModel):
     encoder: Literal["dinov2_windowed_small", "dinov2_windowed_base"]
