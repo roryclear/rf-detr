@@ -4,16 +4,17 @@ from PIL import Image
 import numpy as np
 from collections import defaultdict
 from rfdetr.models.backbone.dinov2 import WindowedDinov2WithRegistersConfig
-from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings, WindowedDinov2WithRegistersEmbeddings, WindowedDinov2WithRegistersLayer
+from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings, WindowedDinov2WithRegistersEmbeddings
 from transformers.utils.backbone_utils import BackboneMixin
 from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
 from transformers.modeling_outputs import BackboneOutput, BaseModelOutput
+from transformers.activations import ACT2FN
 
 import torch
 from torch import nn
 from torch import Tensor
 import torchvision
-from typing import List, Literal, Optional, Union, Tuple, Callable
+from typing import List, Literal, Optional, Union, Tuple, Callable, Set
 from copy import deepcopy
 from pydantic import BaseModel, field_validator
 import os
@@ -99,7 +100,264 @@ OPEN_SOURCE_MODELS = {
     "rf-detr-seg-xxlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
 }
 
+class Dinov2WithRegistersSelfAttention(nn.Module):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size {config.hidden_size,} is not a multiple of the number of attention "
+                f"heads {config.num_attention_heads}."
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        mixed_query_layer = self.query(hidden_states)
+
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
+        # Normalize the attention scores to probabilities.
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(attention_probs)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+
+        context_layer = torch.matmul(attention_probs, value_layer)
+
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape)
+
+        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+
+        return outputs
+
+class Dinov2WithRegistersSelfOutput(nn.Module):
+    """
+    The residual connection is defined in Dinov2WithRegistersLayer instead of here (as is the case with other models), due to the
+    layernorm applied before each block.
+    """
+
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        return hidden_states
+
+class Dinov2WithRegistersAttention(nn.Module):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__()
+        self.attention = Dinov2WithRegistersSelfAttention(config)
+        self.output = Dinov2WithRegistersSelfOutput(config)
+        self.pruned_heads = set()
+
+    def prune_heads(self, heads: Set[int]) -> None:
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.attention.num_attention_heads, self.attention.attention_head_size, self.pruned_heads
+        )
+
+        # Prune linear layers
+        self.attention.query = prune_linear_layer(self.attention.query, index)
+        self.attention.key = prune_linear_layer(self.attention.key, index)
+        self.attention.value = prune_linear_layer(self.attention.value, index)
+        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.attention.num_attention_heads = self.attention.num_attention_heads - len(heads)
+        self.attention.all_head_size = self.attention.attention_head_size * self.attention.num_attention_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        self_outputs = self.attention(hidden_states, head_mask, output_attentions)
+
+        attention_output = self.output(self_outputs[0], hidden_states)
+
+        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        return outputs
+
+class Dinov2WithRegistersSdpaSelfAttention(Dinov2WithRegistersSelfAttention):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__(config)
+        self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
+
+    def forward(
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        if output_attentions:
+            return super().forward(
+                hidden_states=hidden_states, head_mask=head_mask, output_attentions=output_attentions
+            )
+
+        mixed_query_layer = self.query(hidden_states)
+
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+
+        context_layer = torch.nn.functional.scaled_dot_product_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            head_mask,
+            self.attention_probs_dropout_prob if self.training else 0.0,
+            is_causal=False,
+            scale=None,
+        )
+
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape)
+
+        return context_layer, None
+
+
+class Dinov2WithRegistersSdpaAttention(Dinov2WithRegistersAttention):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__(config)
+        self.attention = Dinov2WithRegistersSdpaSelfAttention(config)
+
+DINOV2_WITH_REGISTERS_ATTENTION_CLASSES = {
+    "eager": Dinov2WithRegistersAttention,
+    "sdpa": Dinov2WithRegistersSdpaAttention,
+}
+
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+class Dinov2WithRegistersMLP(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        in_features = out_features = config.hidden_size
+        hidden_features = int(config.hidden_size * config.mlp_ratio)
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        if isinstance(config.hidden_act, str):
+            self.activation = ACT2FN[config.hidden_act]
+        else:
+            self.activation = config.hidden_act
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        hidden_state = self.fc1(hidden_state)
+        hidden_state = self.activation(hidden_state)
+        hidden_state = self.fc2(hidden_state)
+        return hidden_state
+
+class Dinov2WithRegistersLayerScale(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.lambda1 = nn.Parameter(config.layerscale_value * torch.ones(config.hidden_size))
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        return hidden_state * self.lambda1
+
+class WindowedDinov2WithRegistersLayer(nn.Module):
+    """This corresponds to the Block class in the original implementation."""
+
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__()
+
+        self.num_windows = config.num_windows
+
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attention = DINOV2_WITH_REGISTERS_ATTENTION_CLASSES[config._attn_implementation](config)
+        self.layer_scale1 = Dinov2WithRegistersLayerScale(config)
+        self.drop_path = (
+            Dinov2WithRegistersDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
+        )
+
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        if config.use_swiglu_ffn:
+            self.mlp = Dinov2WithRegistersSwiGLUFFN(config)
+        else:
+            self.mlp = Dinov2WithRegistersMLP(config)
+        self.layer_scale2 = Dinov2WithRegistersLayerScale(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        run_full_attention: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        assert head_mask is None, "head_mask is not supported for windowed attention"
+        assert not output_attentions, "output_attentions is not supported for windowed attention"
+        shortcut = hidden_states
+        if run_full_attention:
+            # reshape x to remove windows
+            B, HW, C = hidden_states.shape
+            num_windows_squared = self.num_windows ** 2
+            hidden_states = hidden_states.view(B // num_windows_squared, num_windows_squared * HW, C)
+
+        self_attention_outputs = self.attention(
+            self.norm1(hidden_states),  # in Dinov2WithRegisters, layernorm is applied before self-attention
+            head_mask,
+            output_attentions=output_attentions,
+        )
+        attention_output = self_attention_outputs[0]
+
+        if run_full_attention:
+            # reshape x to add windows back
+            B, HW, C = hidden_states.shape
+            num_windows_squared = self.num_windows ** 2
+            # hidden_states = hidden_states.view(B * num_windows_squared, HW // num_windows_squared, C)
+            attention_output = attention_output.view(B * num_windows_squared, HW // num_windows_squared, C)
+
+        attention_output = self.layer_scale1(attention_output)
+        outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
+
+        # first residual connection
+        hidden_states = self.drop_path(attention_output) + shortcut
+
+        # in Dinov2WithRegisters, layernorm is also applied after self-attention
+        layer_output = self.norm2(hidden_states)
+        layer_output = self.mlp(layer_output)
+        layer_output = self.layer_scale2(layer_output)
+
+        # second residual connection
+        layer_output = self.drop_path(layer_output) + hidden_states
+
+        outputs = (layer_output,) + outputs
+
+        return outputs
 
 class WindowedDinov2WithRegistersEncoder(nn.Module):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
