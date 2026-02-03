@@ -1,7 +1,6 @@
 import requests
 import supervision as sv
 from PIL import Image
-from rfdetr import RFDETRLarge
 from rfdetr.util.coco_classes import COCO_CLASSES
 import numpy as np
 from collections import defaultdict
@@ -478,21 +477,24 @@ excepted_xyxys = [[[61.86511,247.66312,652.24835,930.8383],
  [1.3346028,361.53345,648.7615,1264.4553],
  [622.7613,720.39746,698.4292,787.9133,]],
 
- [[67.79058,248.21106,629.7574,928.6994,],
-[2.8710365,360.7552,576.2327,1256.1041,],
-[1.8651867,659.653,455.1194,1267.9921,]],
+[[68.58226,247.72473,620.7557,930.076,],
+[0.5218291,661.15674,443.4871,1268.1216,],
+[0.4539156,354.61597,641.8059,1264.082,],
+[623.15686,715.6763,701.5986,787.10925,]],
 
-[[67.15638,251.10565,634.4118,929.71875,],
-[2.1100616,654.9501,457.13464,1268.6119,]],
+[[68.8228,247.84683,621.7879,926.59186,],
+[626.37463,731.42664,696.5215,787.97125,],
+[0.79854727,354.81012,647.79254,1265.421,]],
 
-[[69.10416,250.3548,629.37036,926.8027,],
-[1.3762093,659.6178,447.79425,1272.3656,],
-[625.56854,719.8756,696.6235,787.5058, ]],
+[[68.16064,249.01077,633.80927,927.8393,],
+[-0.4972601,660.95166,439.58444,1272.4883,],
+[625.12085,730.7062,695.7922,787.00256,],
+[2.4971795,357.2139,593.81335,1266.8385,]],
 ]
 
 models = [RFDETRNano(), RFDETRSmall(), RFDETRMedium(), RFDETRLarge()]
-image = Image.open(requests.get('https://media.roboflow.com/dog.jpg', stream=True).raw)
 for i, model in enumerate(models):
+  image = Image.open(requests.get('https://media.roboflow.com/dog.jpg', stream=True).raw)
   detections = model.predict(image, threshold=0.5)
   labels = [f"{COCO_CLASSES[class_id]}" for class_id in detections.class_id]
   annotated_image = sv.BoxAnnotator().annotate(image, detections)
