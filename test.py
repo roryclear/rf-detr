@@ -3,29 +3,11 @@ import supervision as sv
 from PIL import Image
 import numpy as np
 from collections import defaultdict
-from rfdetr.models.backbone.dinov2 import get_config, WindowedDinov2WithRegistersConfig
+from rfdetr.models.backbone.dinov2 import WindowedDinov2WithRegistersConfig
 from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersPreTrainedModel, Dinov2WithRegistersPatchEmbeddings, WindowedDinov2WithRegistersEmbeddings, WindowedDinov2WithRegistersEncoder
-from transformers.utils.backbone_utils import (
-    BackboneConfigMixin,
-    BackboneMixin,
-    get_aligned_output_features_output_indices,
-)
-
-from transformers.utils import (
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-    replace_return_docstrings,
-    torch_int,
-)
-
-from transformers.modeling_outputs import (
-    BackboneOutput,
-    BaseModelOutput,
-    BaseModelOutputWithPooling,
-    ImageClassifierOutput,
-)
+from transformers.utils.backbone_utils import BackboneMixin
+from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
+from transformers.modeling_outputs import BackboneOutput
 
 import torch
 from torch import nn
@@ -42,30 +24,10 @@ import math
 import copy
 import argparse
 from torch.nn.init import constant_, xavier_uniform_
+import json
 
-DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING = r"""
-    Args:
-        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
-            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
-            [`BitImageProcessor.preprocess`] for details.
-
-        head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
-            Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
-            tensors for more detail.
-        output_hidden_states (`bool`, *optional*):
-            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
-            more detail.
-        return_dict (`bool`, *optional*):
-            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-"""
-
-_CONFIG_FOR_DOC = "WindowedDinov2WithRegistersConfig"
+DINOV2_WITH_REGISTERS_INPUTS_DOCSTRING = ""
+_CONFIG_FOR_DOC = ""
 
 COCO_CLASSES = {1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airplane", 6: "bus", 7: "train", 8: "truck", 9: "boat",
 10: "traffic light", 11: "fire hydrant", 13: "stop sign", 14: "parking meter", 15: "bench", 16: "bird", 17: "cat", 18: "dog",
@@ -81,12 +43,34 @@ COCO_CLASSES = {1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airpla
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
+size_to_config = {
+    "small": "dinov2_small.json",
+    "base": "dinov2_base.json",
+    "large": "dinov2_large.json",
+}
+
+size_to_config_with_registers = {
+    "small": "dinov2_with_registers_small.json",
+    "base": "dinov2_with_registers_base.json",
+    "large": "dinov2_with_registers_large.json",
+}
+
 size_to_width = {
     "tiny": 192,
     "small": 384,
     "base": 768,
     "large": 1024,
 }
+
+def get_config(size, use_registers):
+    config_dict = size_to_config_with_registers if use_registers else size_to_config
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    configs_dir = os.path.join(current_dir, "dinov2_configs")
+    config_path = os.path.join(configs_dir, config_dict[size])
+    with open(config_path, "r") as f:
+        dino_config = json.load(f)
+    return dino_config
+
 
 PLATFORM_MODELS = {
     "rf-detr-xlarge.pth": "https://storage.googleapis.com/rfdetr/platform-licensed/rf-detr-xlarge.pth",
