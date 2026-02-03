@@ -3,9 +3,8 @@ import supervision as sv
 from PIL import Image
 import numpy as np
 from collections import defaultdict
-from rfdetr.models.transformer import build_transformer
-from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
+from rfdetr.models.transformer import Transformer
 
 import torch
 from torch import nn
@@ -65,6 +64,38 @@ OPEN_SOURCE_MODELS = {
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
 
+def build_transformer(args):
+
+    try:
+        two_stage = args.two_stage
+    except:
+        two_stage = False
+
+    return Transformer(
+        d_model=args.hidden_dim,
+        sa_nhead=args.sa_nheads,
+        ca_nhead=args.ca_nheads,
+        num_queries=args.num_queries,
+        dropout=args.dropout,
+        dim_feedforward=args.dim_feedforward,
+        num_decoder_layers=args.dec_layers,
+        return_intermediate_dec=True,
+        group_detr=args.group_detr,
+        two_stage=two_stage,
+        num_feature_levels=args.num_feature_levels,
+        dec_n_points=args.dec_n_points,
+        lite_refpoint_refine=args.lite_refpoint_refine,
+        decoder_norm_type=args.decoder_norm,
+        bbox_reparam=args.bbox_reparam,
+    )
+
+class BackboneBase(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def get_named_param_lr_pairs(self, args, prefix:str):
+        raise NotImplementedError
+    
 def get_activation(name, inplace=False):
     """ get activation """
     if name == "silu":
