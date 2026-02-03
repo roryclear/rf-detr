@@ -6,7 +6,6 @@ from collections import defaultdict
 from rfdetr.models.transformer import build_transformer
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
-from rfdetr.models.backbone.projector import ConvX
 
 import torch
 from torch import nn
@@ -65,6 +64,41 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def get_activation(name, inplace=False):
+    """ get activation """
+    if name == "silu":
+        module = nn.SiLU(inplace=inplace)
+    elif name == "relu":
+        module = nn.ReLU(inplace=inplace)
+    elif name in ["LeakyReLU", 'leakyrelu', 'lrelu']:
+        module = nn.LeakyReLU(0.1, inplace=inplace)
+    elif name is None:
+        module = nn.Identity()
+    else:
+        raise AttributeError("Unsupported act type: {}".format(name))
+    return module
+
+class ConvX(nn.Module):
+    """ Conv-bn module"""
+    def __init__(self, in_planes, out_planes, kernel=3, stride=1, groups=1, dilation=1, act='relu', layer_norm=False, rms_norm=False):
+        super(ConvX, self).__init__()
+        if not isinstance(kernel, tuple):
+            kernel = (kernel, kernel)
+        padding = (kernel[0] // 2, kernel[1] // 2)
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel,
+                              stride=stride, padding=padding, groups=groups,
+                              dilation=dilation, bias=False)
+        if rms_norm:
+            self.bn = nn.RMSNorm(out_planes)
+        else:
+            self.bn = get_norm('LN', out_planes) if layer_norm else nn.BatchNorm2d(out_planes)
+        self.act = get_activation(act, inplace=True)
+
+    def forward(self, x):
+        """ forward """
+        out = self.act(self.bn(self.conv(x.contiguous())))
+        return out
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
