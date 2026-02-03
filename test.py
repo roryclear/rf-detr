@@ -3,7 +3,6 @@ import supervision as sv
 from PIL import Image
 import numpy as np
 from collections import defaultdict
-from rfdetr.main import populate_args
 from rfdetr.models.backbone import build_backbone
 from rfdetr.models.transformer import build_transformer
 from rfdetr.util.misc import NestedTensor
@@ -21,6 +20,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import math
 import copy
+import argparse
 
 COCO_CLASSES = {1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airplane", 6: "bus", 7: "train", 8: "truck", 9: "boat",
 10: "traffic light", 11: "fire hydrant", 13: "stop sign", 14: "parking meter", 15: "bench", 16: "bird", 17: "cat", 18: "dog",
@@ -64,6 +64,232 @@ OPEN_SOURCE_MODELS = {
 }
 
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
+
+def populate_args(
+    # Basic training parameters
+    num_classes=2,
+    grad_accum_steps=1,
+    print_freq=10,
+    amp=False,
+    lr=1e-4,
+    lr_encoder=1.5e-4,
+    batch_size=2,
+    weight_decay=1e-4,
+    epochs=12,
+    lr_drop=11,
+    clip_max_norm=0.1,
+    lr_vit_layer_decay=0.8,
+    lr_component_decay=1.0,
+    do_benchmark=False,
+
+    # Drop parameters
+    dropout=0,
+    drop_path=0,
+    drop_mode='standard',
+    drop_schedule='constant',
+    cutoff_epoch=0,
+
+    # Model parameters
+    pretrained_encoder=None,
+    pretrain_weights=None,
+    pretrain_exclude_keys=None,
+    pretrain_keys_modify_to_load=None,
+    pretrained_distiller=None,
+
+    # Backbone parameters
+    encoder='vit_tiny',
+    vit_encoder_num_layers=12,
+    window_block_indexes=None,
+    position_embedding='sine',
+    out_feature_indexes=[-1],
+    freeze_encoder=False,
+    layer_norm=False,
+    rms_norm=False,
+    backbone_lora=False,
+    force_no_pretrain=False,
+
+    # Transformer parameters
+    dec_layers=3,
+    dim_feedforward=2048,
+    hidden_dim=256,
+    sa_nheads=8,
+    ca_nheads=8,
+    num_queries=300,
+    group_detr=13,
+    two_stage=False,
+    projector_scale='P4',
+    lite_refpoint_refine=False,
+    num_select=100,
+    dec_n_points=4,
+    decoder_norm='LN',
+    bbox_reparam=False,
+    freeze_batch_norm=False,
+
+    # Matcher parameters
+    set_cost_class=2,
+    set_cost_bbox=5,
+    set_cost_giou=2,
+
+    # Loss coefficients
+    cls_loss_coef=2,
+    bbox_loss_coef=5,
+    giou_loss_coef=2,
+    focal_alpha=0.25,
+    aux_loss=True,
+    sum_group_losses=False,
+    use_varifocal_loss=False,
+    use_position_supervised_loss=False,
+    ia_bce_loss=False,
+
+    # Dataset parameters
+    dataset_file="coco",
+    coco_path=None,
+    dataset_dir=None,
+    square_resize_div_64=False,
+
+    # Output parameters
+    output_dir='output',
+    dont_save_weights=False,
+    checkpoint_interval=10,
+    seed=42,
+    resume='',
+    start_epoch=0,
+    eval=False,
+    use_ema=False,
+    ema_decay=0.9997,
+    ema_tau=0,
+    num_workers=2,
+
+    # Distributed training parameters
+    device='cuda',
+    world_size=1,
+    dist_url='env://',
+    sync_bn=True,
+
+    # FP16
+    fp16_eval=False,
+
+    # Custom args
+    encoder_only=False,
+    backbone_only=False,
+    resolution=640,
+    use_cls_token=False,
+    multi_scale=False,
+    expanded_scales=False,
+    do_random_resize_via_padding=False,
+    warmup_epochs=1,
+    lr_scheduler='step',
+    lr_min_factor=0.0,
+    # Early stopping parameters
+    early_stopping=True,
+    early_stopping_patience=10,
+    early_stopping_min_delta=0.001,
+    early_stopping_use_ema=False,
+    gradient_checkpointing=False,
+    # Additional
+    subcommand=None,
+    **extra_kwargs  # To handle any unexpected arguments
+):
+    args = argparse.Namespace(
+        num_classes=num_classes,
+        grad_accum_steps=grad_accum_steps,
+        print_freq=print_freq,
+        amp=amp,
+        lr=lr,
+        lr_encoder=lr_encoder,
+        batch_size=batch_size,
+        weight_decay=weight_decay,
+        epochs=epochs,
+        lr_drop=lr_drop,
+        clip_max_norm=clip_max_norm,
+        lr_vit_layer_decay=lr_vit_layer_decay,
+        lr_component_decay=lr_component_decay,
+        do_benchmark=do_benchmark,
+        dropout=dropout,
+        drop_path=drop_path,
+        drop_mode=drop_mode,
+        drop_schedule=drop_schedule,
+        cutoff_epoch=cutoff_epoch,
+        pretrained_encoder=pretrained_encoder,
+        pretrain_weights=pretrain_weights,
+        pretrain_exclude_keys=pretrain_exclude_keys,
+        pretrain_keys_modify_to_load=pretrain_keys_modify_to_load,
+        pretrained_distiller=pretrained_distiller,
+        encoder=encoder,
+        vit_encoder_num_layers=vit_encoder_num_layers,
+        window_block_indexes=window_block_indexes,
+        position_embedding=position_embedding,
+        out_feature_indexes=out_feature_indexes,
+        freeze_encoder=freeze_encoder,
+        layer_norm=layer_norm,
+        rms_norm=rms_norm,
+        backbone_lora=backbone_lora,
+        force_no_pretrain=force_no_pretrain,
+        dec_layers=dec_layers,
+        dim_feedforward=dim_feedforward,
+        hidden_dim=hidden_dim,
+        sa_nheads=sa_nheads,
+        ca_nheads=ca_nheads,
+        num_queries=num_queries,
+        group_detr=group_detr,
+        two_stage=two_stage,
+        projector_scale=projector_scale,
+        lite_refpoint_refine=lite_refpoint_refine,
+        num_select=num_select,
+        dec_n_points=dec_n_points,
+        decoder_norm=decoder_norm,
+        bbox_reparam=bbox_reparam,
+        freeze_batch_norm=freeze_batch_norm,
+        set_cost_class=set_cost_class,
+        set_cost_bbox=set_cost_bbox,
+        set_cost_giou=set_cost_giou,
+        cls_loss_coef=cls_loss_coef,
+        bbox_loss_coef=bbox_loss_coef,
+        giou_loss_coef=giou_loss_coef,
+        focal_alpha=focal_alpha,
+        aux_loss=aux_loss,
+        sum_group_losses=sum_group_losses,
+        use_varifocal_loss=use_varifocal_loss,
+        use_position_supervised_loss=use_position_supervised_loss,
+        ia_bce_loss=ia_bce_loss,
+        dataset_file=dataset_file,
+        coco_path=coco_path,
+        dataset_dir=dataset_dir,
+        square_resize_div_64=square_resize_div_64,
+        output_dir=output_dir,
+        dont_save_weights=dont_save_weights,
+        checkpoint_interval=checkpoint_interval,
+        seed=seed,
+        resume=resume,
+        start_epoch=start_epoch,
+        eval=eval,
+        use_ema=use_ema,
+        ema_decay=ema_decay,
+        ema_tau=ema_tau,
+        num_workers=num_workers,
+        device=device,
+        world_size=world_size,
+        dist_url=dist_url,
+        sync_bn=sync_bn,
+        fp16_eval=fp16_eval,
+        encoder_only=encoder_only,
+        backbone_only=backbone_only,
+        resolution=resolution,
+        use_cls_token=use_cls_token,
+        multi_scale=multi_scale,
+        expanded_scales=expanded_scales,
+        do_random_resize_via_padding=do_random_resize_via_padding,
+        warmup_epochs=warmup_epochs,
+        lr_scheduler=lr_scheduler,
+        lr_min_factor=lr_min_factor,
+        early_stopping=early_stopping,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_use_ema=early_stopping_use_ema,
+        gradient_checkpointing=gradient_checkpointing,
+        **extra_kwargs
+    )
+    return args
 
 def _max_by_axis(the_list: List[List[int]]) -> List[int]:
     maxes = the_list[0]
